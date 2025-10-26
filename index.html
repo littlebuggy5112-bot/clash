@@ -19,7 +19,9 @@
             justify-content: center;
             align-items: center;
             min-height: 100vh;
-            overflow: hidden;
+            overflow-x: hidden;
+            overflow-y: auto;
+            touch-action: manipulation;
         }
 
         #gameContainer {
@@ -527,6 +529,7 @@
             position: absolute;
             border: 1px dashed rgba(255,255,255,0.1);
             transition: all 0.2s;
+            touch-action: none;
         }
 
         .grid-cell.valid-drop {
@@ -776,6 +779,7 @@
             cursor: grab;
             transition: all 0.3s;
             position: relative;
+            touch-action: none;
         }
 
         .card:hover:not(.disabled) {
@@ -786,6 +790,14 @@
         .card.dragging {
             opacity: 0.5;
             cursor: grabbing;
+        }
+
+        .card.drag-preview {
+            position: fixed;
+            pointer-events: none;
+            z-index: 2000;
+            opacity: 0.9;
+            transform-origin: top left;
         }
 
         .card.disabled {
@@ -1036,6 +1048,18 @@
             color: white;
             margin: 0;
         }
+
+        @media (max-width: 420px) {
+            body {
+                align-items: flex-start;
+                padding: 20px 0;
+            }
+
+            #gameContainer {
+                transform-origin: top center;
+                transform: scale(calc(100vw / 420));
+            }
+        }
     </style>
 </head>
 <body>
@@ -1260,6 +1284,10 @@
                 };
                 
                 this.draggedCard = null;
+                this.dragSourceCard = null;
+                this.touchDragState = null;
+                this.boundTouchMove = null;
+                this.boundTouchEnd = null;
                 this.init();
             }
 
@@ -1685,18 +1713,12 @@
                     cell.addEventListener('dragover', (e) => {
                         e.preventDefault();
                         if (this.draggedCard) {
-                            const row = parseInt(cell.dataset.row);
-                            
-                            // Allow placement in player's half (bottom 4 rows) for troops
-                            // Allow spells anywhere
-                            if (row >= 4 || this.draggedCard.type === 'spell' || this.draggedCard.type === 'tower') {
-                                cell.classList.add('valid-drop');
-                                cell.classList.remove('invalid-drop');
-                                e.dataTransfer.dropEffect = 'copy';
-                            } else {
-                                cell.classList.add('invalid-drop');
-                                cell.classList.remove('valid-drop');
-                                e.dataTransfer.dropEffect = 'none';
+                            const row = parseInt(cell.dataset.row, 10);
+                            const canDrop = this.canDropDraggedCardOnRow(row);
+                            cell.classList.toggle('valid-drop', canDrop);
+                            cell.classList.toggle('invalid-drop', !canDrop);
+                            if (e.dataTransfer) {
+                                e.dataTransfer.dropEffect = canDrop ? 'copy' : 'none';
                             }
                         }
                     });
@@ -1708,28 +1730,12 @@
                     cell.addEventListener('drop', (e) => {
                         e.preventDefault();
                         if (this.draggedCard) {
-                            const row = parseInt(cell.dataset.row);
-                            const col = parseInt(cell.dataset.col);
-                            
-                            // Allow placement in player's half (bottom 4 rows) for troops
-                            // Allow spells anywhere
-                            if (row >= 4 || this.draggedCard.type === 'spell' || this.draggedCard.type === 'tower') {
-                                const x = col * this.cellSize.width + this.cellSize.width / 2;
-                                const y = row * this.cellSize.height + this.cellSize.height / 2;
-                                
-                                if (this.draggedCard.type === 'spell') {
-                                    this.castSpell(x, y, this.draggedCard);
-                                } else {
-                                    this.spawnUnit(x, y, 'player', this.draggedCard.key);
-                                }
-                                
-                                this.elixir -= this.draggedCard.cost;
-                                this.updateElixirDisplay();
-                                
-                                // Cycle the card
-                                this.cycleCard(this.draggedCard.index);
+                            const row = parseInt(cell.dataset.row, 10);
+                            const col = parseInt(cell.dataset.col, 10);
+                            const placed = this.attemptCardPlacement(row, col);
+                            if (placed) {
+                                this.endCardDrag();
                             }
-                            
                             cell.classList.remove('valid-drop', 'invalid-drop');
                         }
                     });
@@ -1741,30 +1747,241 @@
                 document.querySelectorAll('.card').forEach(card => {
                     card.addEventListener('dragstart', (e) => {
                         const cardKey = card.dataset.card;
-                        const cardIndex = parseInt(card.dataset.index);
-                        const cardData = this.allCards[cardKey];
-                        
-                        if (this.elixir >= cardData.cost && !this.gameOver) {
-                            this.draggedCard = {
-                                key: cardKey,
-                                index: cardIndex,
-                                ...cardData
-                            };
-                            card.classList.add('dragging');
-                            e.dataTransfer.effectAllowed = 'copy';
-                        } else {
+                        const cardIndex = parseInt(card.dataset.index, 10);
+                        const canDrag = this.beginCardDrag(card, cardKey, cardIndex);
+                        if (!canDrag) {
                             e.preventDefault();
+                            return;
+                        }
+                        if (e.dataTransfer) {
+                            e.dataTransfer.effectAllowed = 'copy';
                         }
                     });
 
                     card.addEventListener('dragend', () => {
-                        card.classList.remove('dragging');
-                        this.draggedCard = null;
-                        document.querySelectorAll('.grid-cell').forEach(cell => {
-                            cell.classList.remove('valid-drop', 'invalid-drop');
-                        });
+                        this.endCardDrag();
                     });
+
+                    card.addEventListener('touchstart', (event) => {
+                        this.handleCardTouchStart(event, card);
+                    }, { passive: false });
                 });
+            }
+
+            beginCardDrag(cardElement, cardKey, cardIndex) {
+                if (this.draggedCard || this.gameOver) return false;
+                const cardData = this.allCards[cardKey];
+                if (!cardData) return false;
+                if (this.elixir < cardData.cost) return false;
+
+                this.draggedCard = {
+                    key: cardKey,
+                    index: cardIndex,
+                    ...cardData
+                };
+                this.dragSourceCard = cardElement;
+                cardElement.classList.add('dragging');
+                return true;
+            }
+
+            endCardDrag() {
+                if (this.dragSourceCard) {
+                    this.dragSourceCard.classList.remove('dragging');
+                    this.dragSourceCard = null;
+                }
+                this.removeTouchPreview();
+                this.clearCellHighlights();
+                this.draggedCard = null;
+                this.touchDragState = null;
+                this.detachTouchListeners();
+            }
+
+            handleCardTouchStart(event, cardElement) {
+                if (this.gameOver) return;
+                if (event.touches.length > 1) return;
+                if (this.draggedCard) return;
+
+                const cardKey = cardElement.dataset.card;
+                const cardIndex = parseInt(cardElement.dataset.index, 10);
+                const started = this.beginCardDrag(cardElement, cardKey, cardIndex);
+                if (!started) {
+                    return;
+                }
+
+                const touch = event.changedTouches[0];
+                if (!touch) {
+                    this.endCardDrag();
+                    return;
+                }
+
+                event.preventDefault();
+
+                const preview = this.createTouchPreview(cardElement);
+                this.touchDragState = {
+                    pointerId: touch.identifier,
+                    previewElement: preview,
+                    activeCell: null,
+                    canDrop: false
+                };
+                this.updateTouchPreviewPosition(touch);
+                this.attachTouchListeners();
+            }
+
+            attachTouchListeners() {
+                if (this.boundTouchMove || this.boundTouchEnd) return;
+                this.boundTouchMove = (e) => this.onTouchMove(e);
+                this.boundTouchEnd = (e) => this.onTouchEnd(e);
+                document.addEventListener('touchmove', this.boundTouchMove, { passive: false });
+                document.addEventListener('touchend', this.boundTouchEnd);
+                document.addEventListener('touchcancel', this.boundTouchEnd);
+            }
+
+            detachTouchListeners() {
+                if (this.boundTouchMove) {
+                    document.removeEventListener('touchmove', this.boundTouchMove);
+                    this.boundTouchMove = null;
+                }
+                if (this.boundTouchEnd) {
+                    document.removeEventListener('touchend', this.boundTouchEnd);
+                    document.removeEventListener('touchcancel', this.boundTouchEnd);
+                    this.boundTouchEnd = null;
+                }
+            }
+
+            onTouchMove(event) {
+                if (!this.touchDragState) return;
+                const touch = this.getTouchById(event.touches, this.touchDragState.pointerId);
+                if (!touch) return;
+
+                event.preventDefault();
+                this.updateTouchPreviewPosition(touch);
+                const element = document.elementFromPoint(touch.clientX, touch.clientY);
+                const cell = element ? element.closest('.grid-cell') : null;
+                this.updateTouchHover(cell);
+            }
+
+            onTouchEnd(event) {
+                if (!this.touchDragState) return;
+                const touch = this.getTouchById(event.changedTouches, this.touchDragState.pointerId);
+                if (!touch) return;
+
+                event.preventDefault();
+
+                if (this.touchDragState.activeCell && this.touchDragState.canDrop) {
+                    const cell = this.touchDragState.activeCell;
+                    const row = parseInt(cell.dataset.row, 10);
+                    const col = parseInt(cell.dataset.col, 10);
+                    this.attemptCardPlacement(row, col);
+                }
+
+                this.endCardDrag();
+            }
+
+            createTouchPreview(cardElement) {
+                const preview = document.createElement('div');
+                preview.className = 'card drag-preview';
+                preview.innerHTML = cardElement.innerHTML;
+                const scale = this.getContainerScale();
+                preview.style.transform = `scale(${scale})`;
+                document.body.appendChild(preview);
+                return preview;
+            }
+
+            updateTouchPreviewPosition(touch) {
+                if (!this.touchDragState || !this.touchDragState.previewElement) return;
+                const preview = this.touchDragState.previewElement;
+                const scale = this.getContainerScale();
+                preview.style.transform = `scale(${scale})`;
+                const baseWidth = preview.offsetWidth || 70;
+                const baseHeight = preview.offsetHeight || 100;
+                const halfWidth = (baseWidth * scale) / 2;
+                const halfHeight = (baseHeight * scale) / 2;
+                preview.style.left = `${touch.clientX - halfWidth}px`;
+                preview.style.top = `${touch.clientY - halfHeight}px`;
+            }
+
+            removeTouchPreview() {
+                if (this.touchDragState && this.touchDragState.previewElement) {
+                    this.touchDragState.previewElement.remove();
+                    this.touchDragState.previewElement = null;
+                }
+            }
+
+            clearCellHighlights() {
+                document.querySelectorAll('.grid-cell.valid-drop, .grid-cell.invalid-drop').forEach(cell => {
+                    cell.classList.remove('valid-drop', 'invalid-drop');
+                });
+                if (this.touchDragState) {
+                    this.touchDragState.activeCell = null;
+                    this.touchDragState.canDrop = false;
+                }
+            }
+
+            updateTouchHover(cell) {
+                if (!this.touchDragState) return;
+                const previousCell = this.touchDragState.activeCell;
+                if (previousCell && previousCell !== cell) {
+                    previousCell.classList.remove('valid-drop', 'invalid-drop');
+                }
+
+                if (cell && this.draggedCard) {
+                    const row = parseInt(cell.dataset.row, 10);
+                    const canDrop = this.canDropDraggedCardOnRow(row);
+                    cell.classList.toggle('valid-drop', canDrop);
+                    cell.classList.toggle('invalid-drop', !canDrop);
+                    this.touchDragState.activeCell = cell;
+                    this.touchDragState.canDrop = canDrop;
+                } else {
+                    this.touchDragState.activeCell = null;
+                    this.touchDragState.canDrop = false;
+                }
+            }
+
+            getTouchById(touchList, id) {
+                for (let i = 0; i < touchList.length; i++) {
+                    if (touchList[i].identifier === id) {
+                        return touchList[i];
+                    }
+                }
+                return null;
+            }
+
+            getContainerScale() {
+                const container = document.getElementById('gameContainer');
+                if (!container || !container.offsetWidth) return 1;
+                const rect = container.getBoundingClientRect();
+                const scale = rect.width / container.offsetWidth;
+                return scale || 1;
+            }
+
+            canDropDraggedCardOnRow(row) {
+                if (!this.draggedCard) return false;
+                if (Number.isNaN(row)) return false;
+                if (this.draggedCard.type === 'spell' || this.draggedCard.type === 'tower') {
+                    return true;
+                }
+                return row >= 4;
+            }
+
+            attemptCardPlacement(row, col) {
+                if (!this.draggedCard) return false;
+                if (!this.canDropDraggedCardOnRow(row)) return false;
+                if (Number.isNaN(col)) return false;
+                if (this.elixir < this.draggedCard.cost) return false;
+
+                const x = col * this.cellSize.width + this.cellSize.width / 2;
+                const y = row * this.cellSize.height + this.cellSize.height / 2;
+
+                if (this.draggedCard.type === 'spell') {
+                    this.castSpell(x, y, this.draggedCard);
+                } else {
+                    this.spawnUnit(x, y, 'player', this.draggedCard.key);
+                }
+
+                this.elixir -= this.draggedCard.cost;
+                this.updateElixirDisplay();
+                this.cycleCard(this.draggedCard.index);
+                return true;
             }
 
             spawnUnit(x, y, owner, type) {
